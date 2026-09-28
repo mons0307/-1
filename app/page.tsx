@@ -1,2 +1,2 @@
-import Journal from './journal';
-export default function Home(){return <Journal/>}
+import SchoolApp from './school-app';
+export default function Home(){return <SchoolApp/>}

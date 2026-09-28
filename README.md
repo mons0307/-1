@@ -21,22 +21,17 @@
 단계별 14일 및 매 4일 활동은 사용자의 설계 요구를 반영.
 
 ## 실행과 저장
-Node 22.13 이상. `npm ci`, `npm run dev`, `npm run build`.
-D1 바인딩은 `.openai/hosting.json`의 `DB`.
-마이그레이션: `drizzle/0000_oval_sprite.sql`.
-로컬 저장소 준비는 빌드 후 다음 명령을 한 번 실행:
+학생별 Supabase 이메일/비밀번호 로그인, 담당 학급 교사 조회, 저장 시 실시간 갱신을 지원합니다.
+작성 중 저장한 글도 담당 선생님에게 표시됩니다. 공개 회원가입은 사용하지 않습니다.
+Supabase RLS와 트랜잭션 함수에서 소유권·학급·진도·버전 충돌을 검증합니다.
+Cloudflare Workers 배포 및 계정 생성: [DEPLOYMENT.md](DEPLOYMENT.md).
 
-```
-node --import ./scripts/sites-env.mjs ./node_modules/wrangler/bin/wrangler.js d1 execute DB --local --config dist/server/wrangler.json --persist-to .wrangler/state --file drizzle/0000_oval_sprite.sql
-```
-
-로컬 로그인은 starter의 테스트 계정. 배포는 Sites의 본인 전용 접근 정책 및 서버 전달 사용자 ID에 의존.
-일기는 D1에 사용자별로 저장하고 API는 서버에서 소유자를 결정함. 클라이언트가 사용자 ID를 지정하지 않음.
-상태 버전 및 개별 기록 revision으로 충돌 덮어쓰기 방지. 입력 오류/저장 실패 시 입력을 화면에 유지.
-자동 저장·오프라인 저장·학생별 계정·학급 관리·교사 열람 기능은 포함하지 않음.
-학생용 실제 운영에서는 별도의 학생 접근 방식과 기록 관리 정책을 설계해야 함.
+## 글꼴
+고운돋움(Gowun Dodum)을 WOFF2로 자체 제공하며 외부 폰트 서버에 접속하지 않습니다.
+공식 원본: https://github.com/google/fonts/tree/main/ofl/gowundodum
+SIL Open Font License: public/fonts/OFL.txt. 제목과 본문, 입력창에 동일하게 적용합니다.
 
 ## 확인
-`npm exec tsc -- --noEmit`, 프로덕션 빌드, 모바일 390px 화면, 서두 → 작성 → 저장 → 새로고침 → 일기장 흐름 확인.
-단계 14/15일·28/29일 경계, 매 4일 활동과 44일 순환, 미로그인 차단, 다른 출처 쓰기 차단, 같은 날 중복 진도 차단, 빈 완료 차단, 오래된 버전 충돌 확인.
-WebMCP `preview_gratitude_day` 정상 값/잘못된 값 및 화면 상태 확인.
+`npm run typecheck`, `npm test`, `npm run build`.
+DB 테스트는 익명 접근 차단, 학생 격리, 담당 교사 접근, 역할 변경 차단, 날짜·진도·버전·입력 검증을 포함합니다.
+실제 Supabase Auth/Realtime와 Cloudflare 운영 연결은 프로젝트 설정 후 별도 확인이 필요합니다.
