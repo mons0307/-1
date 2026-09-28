@@ -427,52 +427,20 @@ const LS = {
   set(k,v){ try{ localStorage.setItem(k,JSON.stringify(v)); return true; }catch(e){ return false; } },
   keys(){ try{ return Object.keys(localStorage); }catch(e){ return []; } }
 };
-let DB = null, DOWNLOADS = null, CLOUD = false;
+/* ---- 학급 서버 (Supabase) ---- */
+const SB = {
+  url: "https://wszvhioavajjgdptkeox.supabase.co",
+  key: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6IndzenZoaW9hdmFqamdkcHRrZW94Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTA1NjQzNDIsImV4cCI6MjEwNjE0MDM0Mn0.tac6qHo76ky0YjFsKke_YCIFwbU6EYGcd_Mu5aIfFVo"
+};
+
 let USER = LS.get("ss.user","") || "";
 let SKEY = "";
 let DATA = { name:"", entries:{}, breaks:{}, favorites:[] };
-let unsubMe = null, unsubAll = null;
 let ALL = [];                 // 교사용: 전체 학생
 let MODE = "student";         // student | teacher
-let TEACHER_OK = false;
-let FORM = { url:"", map:null };   // 구글 설문지 연결
-
-/* 구글 설문지 '미리 채워진 링크' 해석 */
-function parseFormUrl(raw){
-  try{
-    const u = new URL(String(raw||"").trim());
-    if(!/docs\.google\.com$/.test(u.hostname) || u.pathname.indexOf("/forms/")<0) return null;
-    const action = u.origin + u.pathname.replace(/\/(viewform|edit|formResponse).*$/, "/viewform");
-    let name="", content="", dateBase="", stage="";
-    u.searchParams.forEach((v,k)=>{
-      if(k.indexOf("entry.")!==0) return;
-      if(v==="이름칸") name=k;
-      else if(v==="내용칸") content=k;
-      else if(/_year$/.test(k)) dateBase=k.replace(/_year$/,"");
-      else if(/_(month|day|hour|minute)$/.test(k)) {}
-      else if(!stage) stage=k;
-    });
-    if(!name || !content) return null;
-    return {action, name, content, dateBase, stage};
-  }catch(e){ return null; }
-}
-function setForm(url){ FORM.url=url||""; FORM.map=parseFormUrl(url); }
-function entryText(e){
-  const L=LEVELS.find(l=>l.n===e.level); const out=[];
-  L.questions.forEach(q=>{ const v=e.answers[q.id]||[]; if(!v.length) return;
-    out.push(q.title); v.forEach(x=>out.push("- "+x)); out.push(""); });
-  return out.join("\n").trim();
-}
-function submitUrl(e){
-  const m=FORM.map; if(!m) return "";
-  const p=new URLSearchParams();
-  p.set("usp","pp_url");
-  p.set(m.name, USER);
-  p.set(m.content, entryText(e));
-  if(m.dateBase){ const d=e.date.split("-"); p.set(m.dateBase+"_year",d[0]); p.set(m.dateBase+"_month",String(+d[1])); p.set(m.dateBase+"_day",String(+d[2])); }
-  if(m.stage){ const L=LEVELS.find(l=>l.n===e.level); p.set(m.stage, e.level+"단계 "+L.title); }
-  return m.action+"?"+p.toString();
-}
+let TEACHER = { token:"", refresh:"", email:"" };
+let SERVER_OK = true;
+let pollTimer = null;
 
 function keyOf(name){
   const b = new TextEncoder().encode(name.trim());
@@ -492,72 +460,99 @@ function loadLocal(){
     : { name:USER, entries:{}, breaks:{}, favorites:[] };
 }
 function saveLocal(){ LS.set(localKey(), DATA); }
-function fullDoc(){
-  return { name:USER, entries:DATA.entries, breaks:DATA.breaks, favorites:DATA.favorites, updatedAt:new Date().toISOString() };
-}
 
-async function initCloud(){
-  try{
-    if(window.claude && typeof claude.use==="function"){
-      DB = await claude.use("db");
-      DOWNLOADS = await claude.use("downloads");
-    }
-  }catch(e){ DB=null; }
-  CLOUD = !!DB;
+/* 보낼 기록 모음 — 인터넷이 끊겨도 잃지 않고, 연결되면 자동으로 전송 */
+function outbox(){ return LS.get("ss.outbox",[]) || []; }
+async function sendRow(kind, slot, date, level, content){
+  const q = outbox();
+  q.push({ student:USER, slot:String(slot), kind, entry_date:date||null, level:level||null, content:content||{} });
+  LS.set("ss.outbox", q);
   setSync();
-  await loadClassConfig();
-  if(CLOUD && USER) await attachMe();
-  if(CLOUD) watchAll();
-  render();
+  return flushOutbox();
+}
+async function flushOutbox(){
+  const q = outbox();
+  if(!q.length){ SERVER_OK=true; setSync(); return true; }
+  try{
+    const r = await fetch(SB.url+"/rest/v1/diary", {
+      method:"POST",
+      headers:{ apikey:SB.key, Authorization:"Bearer "+SB.key,
+                "Content-Type":"application/json", Prefer:"return=minimal" },
+      body: JSON.stringify(q)
+    });
+    if(!r.ok) throw new Error(String(r.status));
+    LS.set("ss.outbox",[]); SERVER_OK=true; setSync(); return true;
+  }catch(e){ SERVER_OK=false; setSync(); return false; }
 }
 function setSync(){
-  const b=document.getElementById("syncBadge");
-  b.className = "sync " + (CLOUD?"on":"off");
-  b.textContent = CLOUD ? "학급에 저장 중" : "이 기기에 저장 중";
-  document.getElementById("footNote").textContent = CLOUD
-    ? "쓴 내용은 우리 학급 저장소에 저장되어 선생님 화면에서 볼 수 있어요."
-    : "쓴 내용은 이 기기 안에만 저장돼요. 브라우저 기록을 지우면 함께 사라지니, 가끔 인쇄하거나 복사해 두세요.";
+  const b=document.getElementById("syncBadge"); if(!b) return;
+  const n=outbox().length;
+  if(n===0 && SERVER_OK){ b.className="sync on"; b.textContent="선생님께 전달됨"; }
+  else { b.className="sync off"; b.textContent="보낼 기록 "+n+"개 · 인터넷 확인"; }
+  const f=document.getElementById("footNote");
+  if(f) f.textContent = (n===0 && SERVER_OK)
+    ? "쓴 내용은 이 태블릿과 학급 서버에 함께 저장돼요. 다른 사람은 내 일기를 볼 수 없고, 선생님만 모아서 보실 수 있어요."
+    : "지금은 이 태블릿에만 저장됐어요. 인터넷이 연결되면 자동으로 선생님께 전달돼요.";
 }
-async function attachMe(){
-  if(!DB || !USER) return;
-  const ref = DB.doc("students/"+SKEY);
+
+/* 선생님 로그인 */
+async function teacherLogin(email, password){
+  const r = await fetch(SB.url+"/auth/v1/token?grant_type=password", {
+    method:"POST", headers:{ apikey:SB.key, "Content-Type":"application/json" },
+    body: JSON.stringify({ email, password })
+  });
+  if(!r.ok) throw new Error("login");
+  const d = await r.json();
+  TEACHER = { token:d.access_token, refresh:d.refresh_token, email:email };
+  LS.set("ss.teacher", TEACHER);
+  return true;
+}
+async function teacherRenew(){
+  if(!TEACHER.refresh) return false;
   try{
-    const s = await ref.get();
-    if(!s.exists) await ref.set(fullDoc());
-    else{
-      const d=s.data()||{};
-      DATA = { name:d.name||USER, entries:d.entries||{}, breaks:d.breaks||{}, favorites:d.favorites||[] };
-      saveLocal();
+    const r = await fetch(SB.url+"/auth/v1/token?grant_type=refresh_token", {
+      method:"POST", headers:{ apikey:SB.key, "Content-Type":"application/json" },
+      body: JSON.stringify({ refresh_token:TEACHER.refresh })
+    });
+    if(!r.ok) return false;
+    const d = await r.json();
+    TEACHER = { token:d.access_token, refresh:d.refresh_token, email:TEACHER.email };
+    LS.set("ss.teacher", TEACHER); return true;
+  }catch(e){ return false; }
+}
+function teacherLogout(){
+  TEACHER={token:"",refresh:"",email:""}; LS.set("ss.teacher",TEACHER);
+  ALL=[]; stopPoll(); MODE="student"; renderTabs(); render();
+}
+async function fetchAll(retried){
+  if(!TEACHER.token) return false;
+  try{
+    const r = await fetch(SB.url+"/rest/v1/diary?select=*&order=created_at.asc&limit=20000",
+      { headers:{ apikey:SB.key, Authorization:"Bearer "+TEACHER.token } });
+    if(r.status===401 && !retried){ if(await teacherRenew()) return fetchAll(true); return false; }
+    if(!r.ok) return false;
+    ALL = buildAll(await r.json());
+    return true;
+  }catch(e){ return false; }
+}
+function buildAll(rows){
+  const m=new Map();
+  (rows||[]).forEach(r=>{
+    const name=(r.student||"").trim() || "(이름 없음)";
+    if(!m.has(name)) m.set(name,{key:name, name, entries:{}, breaks:{}, favorites:[], updatedAt:""});
+    const s=m.get(name);
+    const c=r.content||{};
+    if(r.kind==="entry"){
+      s.entries[r.slot]={ level:r.level, date:r.entry_date, answers:c.answers||{}, savedAt:r.created_at };
+    } else if(r.kind==="break"){
+      s.breaks[r.slot]={ text:c.text||"", date:r.entry_date, title:c.title||"", prompt:c.prompt||"" };
+    } else if(r.kind==="favorite"){
+      s.favorites=s.favorites.filter(f=>f.id!==r.slot);
+      s.favorites.unshift({ id:r.slot, text:c.text||"", date:r.entry_date });
     }
-  }catch(e){ CLOUD=false; setSync(); return; }
-  if(unsubMe) unsubMe();
-  unsubMe = ref.onSnapshot(s=>{
-    if(!s.exists) return;
-    const d=s.data()||{};
-    DATA = { name:d.name||USER, entries:d.entries||{}, breaks:d.breaks||{}, favorites:d.favorites||[] };
-    saveLocal();
-    const a=document.activeElement;
-    if(a && (a.tagName==="TEXTAREA"||a.tagName==="INPUT")) return;  // 쓰는 중에는 화면을 건드리지 않음
-    if(MODE==="student") render();
-  }, ()=>{ CLOUD=false; setSync(); });
-}
-async function pushMe(patch){
-  saveLocal();
-  if(!DB) return;
-  try{
-    await DB.doc("students/"+SKEY).update(Object.assign({name:USER, updatedAt:new Date().toISOString()}, patch));
-  }catch(e){
-    try{ await DB.doc("students/"+SKEY).set(fullDoc()); }
-    catch(e2){ toast("학급 저장소에 보내지 못했어요. 이 기기에는 저장했어요."); }
-  }
-}
-function watchAll(){
-  if(!DB) return;
-  if(unsubAll) unsubAll();
-  unsubAll = DB.collection("students").onSnapshot(s=>{
-    ALL = s.docs.map(d=>{ const v=d.data()||{}; return {key:d.id, name:v.name||nameOf(d.id), entries:v.entries||{}, breaks:v.breaks||{}, favorites:v.favorites||[], updatedAt:v.updatedAt||""}; });
-    if(MODE==="teacher") render();
-  }, ()=>{});
+    s.updatedAt=r.created_at||s.updatedAt;
+  });
+  return Array.from(m.values());
 }
 function localAll(){
   return LS.keys().filter(k=>k.startsWith("ss.data.")).map(k=>{
@@ -565,6 +560,22 @@ function localAll(){
     return {key, name:v.name||nameOf(key), entries:v.entries||{}, breaks:v.breaks||{}, favorites:v.favorites||[], updatedAt:v.updatedAt||""};
   }).filter(s=>Object.keys(s.entries).length || Object.keys(s.breaks).length);
 }
+function startPoll(){
+  stopPoll();
+  pollTimer=setInterval(async()=>{
+    if(MODE!=="teacher" || !TEACHER.token) return;
+    if(await fetchAll()) render();
+  }, 30000);
+}
+function stopPoll(){ if(pollTimer) clearInterval(pollTimer); pollTimer=null; }
+
+async function initServer(){
+  const t=LS.get("ss.teacher",null);
+  if(t && t.token) TEACHER=t;
+  setSync();
+  await flushOutbox();
+}
+window.addEventListener("online", flushOutbox);
 
 /* =========================================================
    3. 도우미
@@ -609,7 +620,7 @@ let current = {tab:"home", breakId:null, date:todayISO(), free:false, tview:"stu
 function renderTabs(){
   const box=$("#tabs"); box.innerHTML="";
   if(MODE==="teacher"){
-    [["student","학생별","🧒"],["date","일자별","📅"],["word","낱말 분석","🔎"],["form","설문지 연결","🔗"],["exit","학생 화면으로","↩"]].forEach(([id,label,icon])=>{
+    [["student","학생별","🧒"],["date","일자별","📅"],["word","낱말 분석","🔎"],["exit","학생 화면으로","↩"]].forEach(([id,label,icon])=>{
       const b=el("button","tab"); b.type="button";
       b.setAttribute("aria-selected", String(current.tview===id && id!=="exit"));
       b.innerHTML=`<span aria-hidden="true">${icon}</span><span>${label}</span>`;
@@ -780,7 +791,7 @@ function viewWrite(){
   const clear=el("button","btn btn-ghost","모두 지우기"); clear.type="button";
   clear.onclick=()=>{ sheet.querySelectorAll("textarea").forEach(t=>{t.value=""; autogrow(t);}); };
   bar.appendChild(clear);
-  bar.appendChild(el("span","note", CLOUD? "저장하면 선생님도 볼 수 있어요.":"저장한 일기는 ‘나의 기록’에 모여요."));
+  bar.appendChild(el("span","note","저장하면 선생님께 전달되고, ‘나의 기록’에도 모여요."));
   sheet.appendChild(bar);
   wrap.appendChild(sheet);
 
@@ -811,7 +822,8 @@ async function saveEntry(L, form){
   const wasNew=!DATA.entries[key];
   const entry={ level:L.n, date, answers, savedAt:new Date().toISOString() };
   DATA.entries = Object.assign({}, DATA.entries, {[key]:entry});
-  await pushMe({ entries:{[key]:entry} });
+  saveLocal();
+  await sendRow("entry", key, date, L.n, { answers });
 
   const prog=progressOf(DATA.entries), idx=stageIndexOf(prog);
   const st=STAGES.find(s=>s.level===L.n);
@@ -821,7 +833,7 @@ async function saveEntry(L, form){
     go("home");
     return;
   }
-  toast(wasNew? (FORM.map? "저장했어요! 아래 ‘선생님께 제출하기’를 눌러 주세요 🌱" : "잘했어요! 일기를 저장했어요 🌱") : "고쳐 쓴 내용을 저장했어요.");
+  toast(wasNew? "잘했어요! 일기를 저장했어요 🌱" : "고쳐 쓴 내용을 저장했어요.");
   go("log",{justSaved:key});
 }
 
@@ -876,7 +888,8 @@ function viewBreakOne(){
   save.onclick=async ()=>{
     const v=ta.value.trim(); DATA.breaks=Object.assign({},DATA.breaks);
     if(v) DATA.breaks[b.id]={text:v,date:todayISO(),title:b.title,prompt:b.prompt}; else delete DATA.breaks[b.id];
-    await pushMe({breaks:DATA.breaks});
+    saveLocal();
+    if(v) await sendRow("break", b.id, todayISO(), null, {title:b.title, prompt:b.prompt, text:v});
     toast(v?"저장했어요 🌱":"내용을 지웠어요."); go("break",{breakId:null});
   };
   bar.appendChild(save); bar.appendChild(el("span","note","‘나의 기록’에서 다시 볼 수 있어요."));
@@ -898,7 +911,8 @@ function viewFav(){
   form.onsubmit=async e=>{
     e.preventDefault(); const v=inp.value.trim(); if(!v) return;
     DATA.favorites=[{id:"f"+Date.now(),text:v,date:todayISO()}, ...DATA.favorites];
-    await pushMe({favorites:DATA.favorites}); inp.value=""; toast("좋아하는 순간에 담았어요 ⭐"); render();
+    saveLocal(); await sendRow("favorite", DATA.favorites[0].id, todayISO(), null, {text:v});
+    inp.value=""; toast("좋아하는 순간에 담았어요 ⭐"); render();
   };
   body.appendChild(form);
   if(!DATA.favorites.length) body.appendChild(el("p","empty","아직 담아 둔 순간이 없어요. 첫 번째 순간을 적어 볼까요?"));
@@ -909,7 +923,7 @@ function viewFav(){
       const t=el("div","txt"); t.innerHTML=`<div>${escapeHtml(f.text)}</div><div style="font-size:13px;color:var(--ink-faint)">${f.date}</div>`;
       li.appendChild(t);
       const del=el("button","mini danger","지우기"); del.type="button";
-      del.onclick=()=>armed(del,"정말 지울까요?",async()=>{ DATA.favorites=DATA.favorites.filter(x=>x.id!==f.id); await pushMe({favorites:DATA.favorites}); render(); });
+      del.onclick=()=>armed(del,"정말 지울까요?",async()=>{ DATA.favorites=DATA.favorites.filter(x=>x.id!==f.id); saveLocal(); render(); });
       li.appendChild(del); ul.appendChild(li);
     });
     body.appendChild(ul);
@@ -942,7 +956,7 @@ function viewLog(){
     if(it.kind==="entry"){
       const L=LEVELS.find(l=>l.n===it.data.level);
       const first=(it.data.answers[L.questions[0].id]||[])[0]||"";
-      sm.innerHTML=`<span class="chip chip-${it.data.level}">${it.data.level}단계 ${L.title}</span><span class="rdate">${it.date}</span><span class="rprev">${escapeHtml(first)}</span>${it.data.sent?'<span class="chip chip-b">✓ 제출함</span>':""}`;
+      sm.innerHTML=`<span class="chip chip-${it.data.level}">${it.data.level}단계 ${L.title}</span><span class="rdate">${it.date}</span><span class="rprev">${escapeHtml(first)}</span>`;
     } else sm.innerHTML=`<span class="chip chip-b">쉬어가기</span><span class="rdate">${it.date}</span><span class="rprev">${escapeHtml(it.data.title)}</span>`;
     if(it.kind==="entry" && current.justSaved===eKey(it.data.date,it.data.level)) d.open=true;
     d.appendChild(sm);
@@ -950,18 +964,6 @@ function viewLog(){
     body.appendChild(renderEntryBody(it));
     const act=el("div","ractions no-print");
     if(it.kind==="entry"){
-      if(FORM.map){
-        const a=el("a","btn btn-main"); a.href=submitUrl(it.data); a.target="_blank"; a.rel="noopener";
-        a.style.cssText="padding:10px 20px;min-height:46px;font-size:16px";
-        a.innerHTML = it.data.sent? '<span aria-hidden="true">↻</span> 다시 제출하기' : '<span aria-hidden="true">📮</span> 선생님께 제출하기';
-        a.onclick=async()=>{
-          const k=eKey(it.data.date,it.data.level);
-          const e2=Object.assign({},DATA.entries[k],{sent:true});
-          DATA.entries=Object.assign({},DATA.entries,{[k]:e2});
-          await pushMe({entries:{[k]:{sent:true}}});
-        };
-        act.appendChild(a);
-      }
       const ed=el("button","mini","고쳐 쓰기"); ed.onclick=()=>go("write",{date:it.data.date, free:it.data.level===3});
       act.appendChild(ed);
     }
@@ -969,8 +971,7 @@ function viewLog(){
     del.onclick=()=>armed(del,"정말 지울까요?",async()=>{
       if(it.kind==="entry"){ const e2=Object.assign({},DATA.entries); delete e2[eKey(it.data.date,it.data.level)]; DATA.entries=e2; }
       else { const b2=Object.assign({},DATA.breaks); delete b2[it.id]; DATA.breaks=b2; }
-      saveLocal(); if(DB){ try{ await DB.doc("students/"+SKEY).set(fullDoc()); }catch(e){} }
-      render(); toast("지웠어요.");
+      saveLocal(); render(); toast("이 기기에서 지웠어요. 선생님께 이미 보낸 기록은 남아 있어요.");
     });
     act.appendChild(del); body.appendChild(act); d.appendChild(body); wrap.appendChild(d);
   });
@@ -1000,7 +1001,7 @@ function armed(btn,msg,fn){
 /* =========================================================
    6. 선생님 화면
    ========================================================= */
-function students(){ return (CLOUD? ALL : localAll()).slice().sort((a,b)=> a.name.localeCompare(b.name,"ko")); }
+function students(){ return ((MODE==="teacher"&&TEACHER.token)? ALL : localAll()).slice().sort((a,b)=> a.name.localeCompare(b.name,"ko")); }
 
 function viewTeacher(){
   const wrap=el("div","stack");
@@ -1008,10 +1009,9 @@ function viewTeacher(){
   if(current.tstudent) return teacherStudent(current.tstudent);
   if(current.tview==="date") return teacherByDate(list);
   if(current.tview==="word") return teacherWords(list);
-  if(current.tview==="form") return teacherForm();
 
   const head=el("div","page-head");
-  head.innerHTML=`<h2>학생별 진행 상황</h2><p>${CLOUD? "학생이 저장하면 이 화면에 바로 반영돼요.":"지금은 이 기기에 저장된 기록만 보여요."} · 학생 ${list.length}명</p>`;
+  head.innerHTML=`<h2>학생별 진행 상황</h2><p>학생 ${list.length}명 · 30초마다 자동으로 새로 불러옵니다${TEACHER.email?" · "+escapeHtml(TEACHER.email):""}</p>`;
   wrap.appendChild(head);
   wrap.appendChild(teacherTools(list));
 
@@ -1060,89 +1060,27 @@ function viewTeacher(){
 
 function teacherTools(list){
   const row=el("div","row no-print");
+  const rf=el("button","mini","🔄 새로 불러오기");
+  rf.onclick=async()=>{ rf.textContent="불러오는 중…"; const ok=await fetchAll(); toast(ok?"최신 기록을 불러왔어요.":"불러오지 못했어요. 인터넷을 확인해 주세요."); render(); };
+  row.appendChild(rf);
   const pr=el("button","mini","🖨 인쇄"); pr.onclick=()=>window.print(); row.appendChild(pr);
   const cp=el("button","mini","📋 글로 복사"); cp.onclick=()=>copyText(allText(list)); row.appendChild(cp);
-  if(DOWNLOADS){
-    const cs=el("button","mini","⬇ 엑셀용 CSV 내려받기");
-    cs.onclick=async()=>{
-      try{ await DOWNLOADS.save({filename:"칭찬일기_기록.csv", data:"﻿"+csvOf(list)}); toast("CSV를 내려받았어요."); }
-      catch(e){ if(e && e.code==="declined") return; toast("내려받지 못했어요. ‘글로 복사’를 이용해 주세요."); }
-    };
-    row.appendChild(cs);
-  }
-  if(!CLOUD){
-    const n=el("span",null,"※ 학급 저장소에 연결되지 않아 이 기기 기록만 보입니다.");
-    n.style.cssText="font-size:14px;color:var(--sun-ink)"; row.appendChild(n);
-  }
-  return row;
-}
-
-function teacherForm(){
-  const wrap=el("div","stack");
-  const head=el("div","page-head");
-  head.innerHTML=`<h2>구글 설문지 연결</h2><p>설문지에서 ‘미리 채워진 링크 가져오기’로 복사한 주소를 붙여넣으면, 학생 화면에 <b>선생님께 제출하기</b> 버튼이 생깁니다.</p>`;
-  wrap.appendChild(head);
-
-  const sheet=el("div","tsheet"); const b=el("div","sheet-body");
-  const guide=el("div","q"); guide.style.cssText="padding:0 0 18px;border:none";
-  guide.innerHTML=`<p class="hint" style="margin:0 0 10px">설문지에는 질문 네 개를 만들고, 미리 채우기 화면에서 <b>이름 칸에 ‘이름칸’</b>, <b>오늘의 일기 칸에 ‘내용칸’</b>이라고 적은 뒤 링크를 복사하세요.</p>
-    <p class="hint" style="margin:0">단계 질문의 보기는 <b>1단계 알아차리기 / 2단계 돌아보고 소중히 여기기 / 3단계 감사 연습하기</b> 로 적어야 자동으로 선택됩니다.</p>`;
-  b.appendChild(guide);
-
-  const ta=el("textarea"); ta.rows=4; ta.value=FORM.url||"";
-  ta.placeholder="https://docs.google.com/forms/d/e/…/viewform?usp=pp_url&entry.123456=이름칸&…";
-  ta.style.cssText="width:100%;background:var(--card-2);border:1px solid var(--line);border-radius:var(--r-md);padding:14px;line-height:1.6;resize:vertical;font-size:15px;word-break:break-all";
-  b.appendChild(ta);
-
-  const result=el("div"); result.style.marginTop="14px";
-  function showCheck(url){
-    const m=parseFormUrl(url);
-    result.innerHTML="";
-    if(!url.trim()){ result.appendChild(el("p","hint","아직 연결되지 않았어요.")); return; }
-    if(!m){ const p=el("p","notice","주소를 알아보지 못했어요. ‘미리 채워진 링크 가져오기’에서 복사한 주소가 맞는지, 이름 칸에 ‘이름칸’, 일기 칸에 ‘내용칸’을 적었는지 확인해 주세요."); result.appendChild(p); return; }
-    const ok=el("div","row");
-    [["이름",true],["오늘의 일기",true],["날짜",!!m.dateBase],["단계",!!m.stage]].forEach(([n,v])=>{
-      const c=el("span","chip "+(v?"chip-b":"chip-2"), (v?"✓ ":"− ")+n);
-      ok.appendChild(c);
-    });
-    result.appendChild(ok);
-    const note=el("p","hint", (m.dateBase&&m.stage)? "네 항목 모두 연결됐어요. 학생 화면에 제출 버튼이 나타납니다."
-      : "표시가 없는 항목은 설문지에 그 질문이 없거나 미리 채우기에서 값을 넣지 않은 경우예요. 나머지만으로도 제출은 됩니다.");
-    note.style.marginTop="10px"; result.appendChild(note);
-  }
-  b.appendChild(result);
-  showCheck(ta.value);
-  ta.addEventListener("input",()=>showCheck(ta.value));
-
-  const bar=el("div","row"); bar.style.marginTop="18px";
-  const save=el("button","btn btn-main"); save.innerHTML='<span aria-hidden="true">🔗</span> 연결 저장하기';
-  save.onclick=async()=>{
-    await saveClassConfig({formUrl:ta.value.trim()});
-    toast(FORM.map? "설문지를 연결했어요." : "저장했어요. 주소를 다시 확인해 주세요.");
-    render();
+  const cs=el("button","mini","⬇ 엑셀용 CSV 내려받기");
+  cs.onclick=()=>{
+    try{
+      const blob=new Blob(["\ufeff"+csvOf(list)],{type:"text/csv;charset=utf-8"});
+      const a=document.createElement("a"); a.href=URL.createObjectURL(blob);
+      a.download="칭찬일기_"+todayISO()+".csv";
+      document.body.appendChild(a); a.click();
+      setTimeout(()=>{ URL.revokeObjectURL(a.href); a.remove(); },1000);
+      toast("CSV를 내려받았어요.");
+    }catch(e){ toast("내려받지 못했어요. ‘글로 복사’를 이용해 주세요."); }
   };
-  bar.appendChild(save);
-  const clr=el("button","btn btn-ghost","연결 해제");
-  clr.onclick=async()=>{ await saveClassConfig({formUrl:""}); toast("연결을 해제했어요."); render(); };
-  bar.appendChild(clr);
-  b.appendChild(bar);
-
-  if(!CLOUD){
-    const n=el("p","notice"); n.innerHTML="지금은 학급 저장소에 연결되어 있지 않아, 이 설정이 <b>이 기기에만</b> 저장됩니다. 학생 태블릿마다 한 번씩 넣어 주셔야 해요.";
-    n.style.marginTop="16px"; b.appendChild(n);
-  }
-  sheet.appendChild(b); wrap.appendChild(sheet);
-
-  if(FORM.map){
-    const test=el("div","tsheet"); const tb=el("div","sheet-body");
-    tb.appendChild(el("h3",null,"미리 보기")).style.cssText="margin:0 0 10px;font-size:19px";
-    const sample={ level:1, date:todayISO(), answers:{q1:["과학 시간에 강낭콩 씨앗을 심었다"],q2:["짝꿍이 지우개를 빌려주었다"],q3:["따뜻한 날씨"]} };
-    const a=el("a","btn btn-ghost","시험 삼아 열어 보기"); a.href=submitUrl(sample); a.target="_blank"; a.rel="noopener";
-    tb.appendChild(el("p","hint","아래 버튼을 누르면 학생이 보게 될 화면이 그대로 열립니다. 시험 제출한 응답은 스프레드시트에서 지우면 돼요."));
-    tb.appendChild(a);
-    test.appendChild(tb); wrap.appendChild(test);
-  }
-  return wrap;
+  row.appendChild(cs);
+  const out=el("button","mini","로그아웃");
+  out.onclick=()=>armed(out,"로그아웃할까요?",()=>teacherLogout());
+  row.appendChild(out);
+  return row;
 }
 
 function teacherStudent(key){
@@ -1155,6 +1093,15 @@ function teacherStudent(key){
   const head=el("div","page-head");
   head.innerHTML=`<h2>${escapeHtml(s.name)}</h2><p>1단계 ${p[1]}/10 · 2단계 ${p[2]}/10 · 3단계 ${p[3]}/100 · 전체 ${Object.keys(s.entries).length}편</p>`;
   wrap.appendChild(head);
+  const tools=el("div","row no-print");
+  const restore=el("button","mini","⬅ 이 학생 기록을 이 태블릿으로 불러오기");
+  restore.onclick=()=>armed(restore,"이 태블릿의 내용을 덮어씁니다.",()=>{
+    USER=s.name; SKEY=keyOf(s.name); LS.set("ss.user",USER);
+    DATA={ name:s.name, entries:JSON.parse(JSON.stringify(s.entries)), breaks:JSON.parse(JSON.stringify(s.breaks)), favorites:JSON.parse(JSON.stringify(s.favorites)) };
+    saveLocal(); toast(s.name+" 학생의 기록을 이 태블릿으로 가져왔어요.");
+  });
+  tools.appendChild(restore);
+  wrap.appendChild(tools);
   const items=[ ...entryList(s.entries).map(e=>({kind:"entry",date:e.date,data:e})),
                 ...Object.entries(s.breaks||{}).map(([k,v])=>({kind:"break",date:v.date,id:k,data:v})) ]
               .sort((a,b)=> a.date<b.date?1:-1);
@@ -1361,63 +1308,50 @@ function openNameGate(){
     USER=v; SKEY=keyOf(v); LS.set("ss.user",USER);
     loadLocal(); DATA.name=USER;
     closeGate(); render();
-    if(CLOUD) await attachMe();
-    render();
+    flushOutbox();
   };
   $("#gGo").onclick=done;
   i.onkeydown=e=>{ if(e.key==="Enter") done(); };
 }
-let CONFIG = { pin:"", formUrl:"" };
-async function loadClassConfig(){
-  CONFIG = { pin:LS.get("ss.pin","")||"", formUrl:LS.get("ss.formUrl","")||"" };
-  if(DB){
-    try{
-      const s=await DB.doc("class/config").get();
-      if(s.exists){ const d=s.data()||{}; CONFIG={ pin:d.pin||CONFIG.pin, formUrl:d.formUrl||CONFIG.formUrl }; }
-    }catch(e){}
-  }
-  setForm(CONFIG.formUrl);
-}
-async function saveClassConfig(patch){
-  CONFIG=Object.assign({},CONFIG,patch);
-  LS.set("ss.pin",CONFIG.pin); LS.set("ss.formUrl",CONFIG.formUrl);
-  setForm(CONFIG.formUrl);
-  if(DB){ try{ await DB.doc("class/config").set({pin:CONFIG.pin, formUrl:CONFIG.formUrl, updatedAt:new Date().toISOString()}); }catch(e){} }
-}
-async function readPin(){ await loadClassConfig(); return CONFIG.pin; }
-async function writePin(pin){ await saveClassConfig({pin}); }
 async function openTeacherGate(){
-  const pin=await readPin();
-  if(!pin){
-    gateBox.innerHTML=`<h2>선생님 화면 만들기</h2>
-      <p>선생님만 쓰는 번호를 정해 주세요. 학생 화면에서 이 번호를 눌러야 기록을 볼 수 있어요.<br>처음 한 번만 정하면 됩니다.</p>
-      <input id="gPin" type="password" inputmode="numeric" placeholder="숫자 4자리" maxlength="12" autocomplete="off">
-      <button class="btn btn-main" id="gGo">번호 정하기</button>
-      <button class="alt" id="gCancel">그만두기</button>`;
-  } else {
-    gateBox.innerHTML=`<h2>선생님 화면</h2>
-      <p>선생님 번호를 입력해 주세요.</p>
-      <input id="gPin" type="password" inputmode="numeric" placeholder="선생님 번호" maxlength="12" autocomplete="off">
-      <button class="btn btn-main" id="gGo">들어가기</button>
-      <button class="alt" id="gCancel">그만두기</button>`;
-  }
+  gateBox.innerHTML=`<h2>선생님 화면</h2>
+    <p>Supabase에 만들어 두신 선생님 계정으로 로그인하세요.<br>학생은 로그인할 필요가 없습니다.</p>
+    <input id="gEmail" type="email" placeholder="이메일" autocomplete="username" style="margin-bottom:10px">
+    <input id="gPw" type="password" placeholder="비밀번호" autocomplete="current-password">
+    <button class="btn btn-main" id="gGo">들어가기</button>
+    <button class="alt" id="gCancel">그만두기</button>`;
   gate.classList.remove("hidden");
-  const i=$("#gPin"); setTimeout(()=>i.focus(),60);
+  const em=$("#gEmail"), pw=$("#gPw"), btn=$("#gGo");
+  em.value=TEACHER.email||""; setTimeout(()=>(em.value?pw:em).focus(),60);
   const done=async()=>{
-    const v=i.value.trim(); if(!v) return;
-    if(!pin){ await writePin(v); TEACHER_OK=true; }
-    else if(v!==pin){ toast("번호가 달라요."); i.value=""; return; }
-    else TEACHER_OK=true;
-    closeGate(); MODE="teacher"; current.tview="student"; current.tstudent=null; current.tdate=todayISO();
-    if(CLOUD) watchAll();
-    renderTabs(); render();
+    const e=em.value.trim(), p=pw.value;
+    if(!e||!p) return;
+    btn.textContent="확인 중…"; btn.disabled=true;
+    try{
+      await teacherLogin(e,p);
+      const ok=await fetchAll();
+      closeGate();
+      MODE="teacher"; current.tview="student"; current.tstudent=null; current.tdate=todayISO();
+      startPoll(); renderTabs(); render();
+      if(!ok) toast("로그인했지만 기록을 불러오지 못했어요. ‘새로 불러오기’를 눌러 보세요.");
+    }catch(err){
+      btn.textContent="들어가기"; btn.disabled=false; pw.value="";
+      toast("이메일이나 비밀번호가 맞지 않아요.");
+    }
   };
-  $("#gGo").onclick=done;
+  btn.onclick=done;
   $("#gCancel").onclick=closeGate;
-  i.onkeydown=e=>{ if(e.key==="Enter") done(); };
+  pw.onkeydown=e=>{ if(e.key==="Enter") done(); };
+  em.onkeydown=e=>{ if(e.key==="Enter") pw.focus(); };
 }
 $("#whoami").onclick=openNameGate;
-$("#teacherBtn").onclick=()=>{ if(TEACHER_OK){ MODE="teacher"; renderTabs(); render(); } else openTeacherGate(); };
+$("#teacherBtn").onclick=async()=>{
+  if(TEACHER.token){
+    MODE="teacher"; current.tview="student"; current.tstudent=null;
+    renderTabs(); render(); startPoll();
+    if(await fetchAll()) render();
+  } else openTeacherGate();
+};
 $("#themeBtn").onclick=()=>{
   const cur=document.documentElement.getAttribute("data-theme");
   const next = cur==="dark" ? "light" : "dark";
@@ -1427,11 +1361,10 @@ const savedTheme=LS.get("ss.theme",null);
 if(savedTheme==="dark"||savedTheme==="light") document.documentElement.setAttribute("data-theme",savedTheme);
 
 if(USER){ SKEY=keyOf(USER); loadLocal(); }
-setSync();
 renderTabs();
 render();
 if(!USER) openNameGate();
-initCloud();
+initServer();
 </script>
 </body>
 </html>
