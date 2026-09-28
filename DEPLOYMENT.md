@@ -1,6 +1,6 @@
 # GitHub → Cloudflare → Supabase 연결 안내
 
-이 폴더 전체가 앱 프로젝트입니다. 기존 GitHub의 `index.html` 칭찬일기와는 별개이며, Cloudflare는 이 프로젝트를 **Workers**로 빌드합니다. Pages의 정적 HTML 배포 설정을 사용하지 마세요.
+이 폴더 전체가 앱 프로젝트입니다. 기존 GitHub의 칭찬일기 파일은 `legacy/praise/index.html`에 그대로 보관했습니다. 루트에 두면 개발 서버의 감사일기 경로와 겹치므로 보관 위치를 옮겼습니다. Cloudflare는 이 프로젝트를 **Workers**로 빌드합니다. Pages의 정적 HTML 배포 설정을 사용하지 마세요.
 
 ## 1. GitHub
 
